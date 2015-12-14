@@ -71,6 +71,8 @@ import com.android.server.wifi.hotspot2.omadm.MOManager;
 import com.android.server.wifi.hotspot2.pps.Credential;
 import com.android.server.wifi.hotspot2.pps.HomeSP;
 
+import cyanogenmod.providers.CMSettings;
+
 import java.io.BufferedInputStream;
 import java.io.BufferedReader;
 import java.io.DataInputStream;
@@ -393,8 +395,8 @@ public class WifiConfigStore extends IpConfigStore {
 
     public static final int maxNumScanCacheEntries = 128;
 
-    public final AtomicBoolean enableHalBasedPno = new AtomicBoolean(true);
-    public final AtomicBoolean enableSsidWhitelist = new AtomicBoolean(true);
+    public final AtomicBoolean enableHalBasedPno = new AtomicBoolean(false);
+    public final AtomicBoolean enableSsidWhitelist = new AtomicBoolean(false);
     public final AtomicBoolean enableAutoJoinWhenAssociated = new AtomicBoolean(true);
     public final AtomicBoolean enableFullBandScanWhenAssociated = new AtomicBoolean(true);
     public final AtomicBoolean enableChipWakeUpWhenAssociated = new AtomicBoolean(true);
@@ -470,7 +472,7 @@ public class WifiConfigStore extends IpConfigStore {
             WifiEnterpriseConfig.CA_CERT_KEY, WifiEnterpriseConfig.SUBJECT_MATCH_KEY,
             WifiEnterpriseConfig.ENGINE_KEY, WifiEnterpriseConfig.ENGINE_ID_KEY,
             WifiEnterpriseConfig.PRIVATE_KEY_ID_KEY, WifiEnterpriseConfig.ALTSUBJECT_MATCH_KEY,
-            WifiEnterpriseConfig.DOM_SUFFIX_MATCH_KEY
+            WifiEnterpriseConfig.DOM_SUFFIX_MATCH_KEY, WifiEnterpriseConfig.PHASE1_KEY
     };
 
 
@@ -986,24 +988,42 @@ public class WifiConfigStore extends IpConfigStore {
         if (VDBG) localLog("selectNetwork", config.networkId);
         if (config.networkId == INVALID_NETWORK_ID) return false;
 
-        // Reset the priority of each network at start or if it goes too high.
-        if (mLastPriority == -1 || mLastPriority > 1000000) {
-            for(WifiConfiguration config2 : mConfiguredNetworks.values()) {
-                if (updatePriorities) {
-                    if (config2.networkId != INVALID_NETWORK_ID) {
-                        config2.priority = 0;
-                        setNetworkPriorityNative(config2.networkId, config.priority);
+        final boolean autoConfigure = isAutoConfigPriorities();
+        if (autoConfigure) {
+            // Reset the priority of each network at start or if it goes too high.
+            if (mLastPriority == -1 || mLastPriority > 1000000) {
+                for (WifiConfiguration config2 : mConfiguredNetworks.values()) {
+                    if (updatePriorities) {
+                        if (config2.networkId != INVALID_NETWORK_ID) {
+                            config2.priority = 0;
+                            setNetworkPriorityNative(config2.networkId, config.priority);
+                        }
                     }
                 }
             }
-            mLastPriority = 0;
+        } else {
+            // Ensure that last priority is reestablished if auto configuration is reenabled
+            for (WifiConfiguration wifiConfiguration : mConfiguredNetworks.values()) {
+                if (wifiConfiguration != null && wifiConfiguration.priority > mLastPriority) {
+                    mLastPriority = wifiConfiguration.priority;
+                }
+            }
         }
 
+
         // Set to the highest priority and save the configuration.
-        if (updatePriorities) {
-            config.priority = ++mLastPriority;
-            setNetworkPriorityNative(config.networkId, config.priority);
-            buildPnoList();
+        if (autoConfigure) {
+            if (updatePriorities) {
+                config.priority = ++mLastPriority;
+                setNetworkPriorityNative(config.networkId, config.priority);
+                buildPnoList();
+            }
+        } else {
+            // Use the lastknown configuration to recover the priority
+            WifiConfiguration lastKnown = mConfiguredNetworks.get(config.networkId);
+            if (lastKnown != null) {
+                config.priority = lastKnown.priority;
+            }
         }
 
         if (config.isPasspoint()) {
@@ -1023,6 +1043,8 @@ public class WifiConfigStore extends IpConfigStore {
             }
         }
 
+        mWifiNative.setHs20(config.isPasspoint());
+
         if (updatePriorities)
             mWifiNative.saveConfig();
         else
@@ -1032,7 +1054,7 @@ public class WifiConfigStore extends IpConfigStore {
         writeKnownNetworkHistory(false);
 
         /* Enable the given network while disabling all other networks */
-        enableNetworkWithoutBroadcast(config.networkId, true);
+        enableNetworkWithoutBroadcast(config.networkId, autoConfigure);
 
        /* Avoid saving the config & sending a broadcast to prevent settings
         * from displaying a disabled list of networks */
@@ -1791,7 +1813,7 @@ public class WifiConfigStore extends IpConfigStore {
         mLastPriority = 0;
 
         mConfiguredNetworks.clear();
-
+        List<WifiConfiguration> configTlsResetList = new ArrayList<WifiConfiguration>();
         int last_id = -1;
         boolean done = false;
         while (!done) {
@@ -1847,8 +1869,8 @@ public class WifiConfigStore extends IpConfigStore {
                     mLastPriority = config.priority;
                 }
 
-                config.setIpAssignment(IpAssignment.DHCP);
-                config.setProxySettings(ProxySettings.NONE);
+            config.setIpAssignment(IpAssignment.DHCP);
+            config.setProxySettings(ProxySettings.NONE);
 
                 if (mConfiguredNetworks.getByConfigKey(config.configKey()) != null) {
                     // That SSID is already known, just ignore this duplicate entry
@@ -1859,6 +1881,14 @@ public class WifiConfigStore extends IpConfigStore {
                 } else {
                     if (showNetworks) log("Ignoring loaded configured for network " + config.networkId
                         + " because config are not valid");
+                }
+
+                if (config != null && config.enterpriseConfig != null &&
+                        config.enterpriseConfig.getEapMethod() < WifiEnterpriseConfig.Eap.PWD) {
+                    if (!config.enterpriseConfig.getTls12Enable()) {
+                        //re-enable the TLS1.2 every time when load the network
+                        configTlsResetList.add(config);
+                    }
                 }
             }
 
@@ -1882,6 +1912,12 @@ public class WifiConfigStore extends IpConfigStore {
             logContents(SUPPLICANT_CONFIG_FILE);
             logContents(SUPPLICANT_CONFIG_FILE_BACKUP);
             logContents(networkHistoryConfigFile);
+        }
+
+        //reset TLS default to 1.2
+        for (WifiConfiguration config : configTlsResetList) {
+            config.enterpriseConfig.setTls12Enable(true);
+            addOrUpdateNetwork(config, WifiConfiguration.UNKNOWN_UID);
         }
     }
 
@@ -4627,5 +4663,10 @@ public class WifiConfigStore extends IpConfigStore {
                 }
             }
         }
+    }
+
+    private boolean isAutoConfigPriorities() {
+        return CMSettings.Global.getInt(mContext.getContentResolver(),
+                CMSettings.Global.WIFI_AUTO_PRIORITIES_CONFIGURATION, 1) != 0;
     }
 }
